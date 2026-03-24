@@ -175,6 +175,11 @@ def evaluate(model, eval_loader, topk_list, beam_size, device):
     avg_ndcgs = {k: sum(v) / len(v) for k, v in ndcgs.items()}
     return avg_recalls, avg_ndcgs
 
+
+def evaluate_ndcg20(model, eval_loader, device):
+    _, avg_ndcgs = evaluate(model, eval_loader, topk_list=[20], beam_size=20, device=device)
+    return avg_ndcgs['NDCG@20']
+
 def set_seed(seed):
     """Set random seed for reproducibility."""
     random.seed(seed)
@@ -211,6 +216,8 @@ if __name__ == "__main__":
     parser.add_argument('--early_stop', type=int, default=10, help='Early stopping patience')
     parser.add_argument('--topk_list', type=list, default=[5,10,20], help='List of top-k values for evaluation metrics')
     parser.add_argument('--beam_size', type=int, default=30, help='Beam size for generation')
+    parser.add_argument('--ndcg20_eval_interval', type=int, default=1, help='Run validation NDCG@20 every x epochs')
+    parser.add_argument('--full_eval_interval', type=int, default=20, help='Run full Recall/NDCG evaluation every x epochs')
     config = vars(parser.parse_args())
     # Set up logging
     logging.basicConfig(
@@ -220,6 +227,10 @@ if __name__ == "__main__":
     )
 
     logging.info(f"Configuration: {config}")
+    if config['ndcg20_eval_interval'] < 1:
+        raise ValueError("ndcg20_eval_interval must be >= 1")
+    if config['full_eval_interval'] < 1:
+        raise ValueError("full_eval_interval must be >= 1")
     
     # Initialize model
     model = TIGER(config)
@@ -269,6 +280,29 @@ if __name__ == "__main__":
 
     # Train the model
     model.to(device)
+    if config["mode"] == "evaluation":
+        if not os.path.exists(config["save_path"]):
+            raise FileNotFoundError(f"Model checkpoint not found: {config['save_path']}")
+
+        state_dict = torch.load(config["save_path"], map_location=device)
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        test_avg_recalls, test_avg_ndcgs = evaluate(
+            model,
+            test_dataloader,
+            config["topk_list"],
+            config["beam_size"],
+            device
+        )
+        logging.info(f"Loaded model from {config['save_path']}")
+        logging.info(f"Test Dataset: {test_avg_recalls}")
+        logging.info(f"Test Dataset: {test_avg_ndcgs}")
+        print(f"Loaded model from {config['save_path']}")
+        print(f"Test Dataset Recall: {test_avg_recalls}")
+        print(f"Test Dataset NDCG: {test_avg_ndcgs}")
+        raise SystemExit(0)
+
     best_ndcg = 0.0
     early_stop_counter = 0
     
@@ -276,17 +310,38 @@ if __name__ == "__main__":
         logging.info(f"Epoch {epoch + 1}/{config['num_epochs']}")
         train_loss = train(model, train_dataloader, optimizer, device)
         logging.info(f"Training loss: {train_loss}")
-        # Evaluate the model
-        avg_recalls, avg_ndcgs = evaluate(model, validation_dataloader, config['topk_list'], config['beam_size'], device)
-        logging.info(f"Validation Dataset: {avg_recalls}")
-        logging.info(f"Validation Dataset: {avg_ndcgs}")
-        if avg_ndcgs['NDCG@20'] > best_ndcg:
-            best_ndcg = avg_ndcgs['NDCG@20']
+        run_ndcg20_eval = ((epoch + 1) % config['ndcg20_eval_interval'] == 0)
+        run_full_eval = ((epoch + 1) % config['full_eval_interval'] == 0)
+
+        if not run_ndcg20_eval:
+            logging.info(
+                "Skipped validation NDCG@20 this epoch; "
+                f"it runs every {config['ndcg20_eval_interval']} epochs."
+            )
+            continue
+
+        # Run a lightweight validation for early stop and checkpointing.
+        val_ndcg20 = evaluate_ndcg20(model, validation_dataloader, device)
+        logging.info(f"Validation Dataset: {{'NDCG@20': {val_ndcg20}}}")
+
+        if run_full_eval:
+            avg_recalls, avg_ndcgs = evaluate(model, validation_dataloader, config['topk_list'], config['beam_size'], device)
+            logging.info(f"Validation Dataset: {avg_recalls}")
+            logging.info(f"Validation Dataset: {avg_ndcgs}")
+
+        if val_ndcg20 > best_ndcg:
+            best_ndcg = val_ndcg20
             early_stop_counter = 0  # Reset early stop counter
-            test_avg_recalls, test_avg_ndcgs = evaluate(model, test_dataloader, config['topk_list'], config['beam_size'], device)
             logging.info(f"Best NDCG@20: {best_ndcg}")
-            logging.info(f"Test Dataset: {test_avg_recalls}")
-            logging.info(f"Test Dataset: {test_avg_ndcgs}")
+            if run_full_eval:
+                test_avg_recalls, test_avg_ndcgs = evaluate(model, test_dataloader, config['topk_list'], config['beam_size'], device)
+                logging.info(f"Test Dataset: {test_avg_recalls}")
+                logging.info(f"Test Dataset: {test_avg_ndcgs}")
+            else:
+                logging.info(
+                    "Skipped full Recall/NDCG evaluation this epoch; "
+                    f"it runs every {config['full_eval_interval']} epochs."
+                )
             # Save the best model
             torch.save(model.state_dict(), config['save_path'])
             logging.info(f"Best model saved to {config['save_path']}")

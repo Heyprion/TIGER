@@ -1,0 +1,5 @@
+dataset: Beauty
+ckpt_path: ./ckpt/Beauty/Mar-24-2026_01-32-24/best_collision_model.pth
+output_file: ../data/Beauty/Beauty_t5_rqvae.npy
+device: cuda:0
+batch_size: 64
